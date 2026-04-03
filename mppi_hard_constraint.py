@@ -1,24 +1,52 @@
+import argparse
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.animation import FuncAnimation
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
 import time
 
 
 @dataclass
 class Obstacle:
-    """Represents a circular obstacle in the environment"""
+    """Represents an obstacle (circle or rectangle) in the environment."""
 
     x: float
     y: float
-    radius: float
+    radius: float                       # circle radius; ignored for rectangles
     safety_margin: float = 0.2
+    shape: str = "circle"               # "circle" or "rectangle"
+    width: Optional[float] = None       # rectangle full width  (shape="rectangle")
+    height: Optional[float] = None      # rectangle full height (shape="rectangle")
+
     @property
     def inflated_radius(self) -> float:
-        """Return the radius including safety margin"""
+        """Circle only: radius + safety margin."""
         return self.radius + self.safety_margin
+
+    def distance_from_surface(self, pos: np.ndarray) -> float:
+        """
+        Signed distance from *pos* to the obstacle surface.
+        Positive  → outside   |  Negative → inside (collision)
+        """
+        if self.shape == "circle":
+            return float(np.linalg.norm(pos - np.array([self.x, self.y])) - self.radius)
+        # Rectangle SDF (axis-aligned)
+        hw = (self.width  or self.radius * 2) / 2.0
+        hh = (self.height or self.radius * 2) / 2.0
+        qx = abs(pos[0] - self.x) - hw
+        qy = abs(pos[1] - self.y) - hh
+        outside = np.sqrt(max(qx, 0.0) ** 2 + max(qy, 0.0) ** 2)
+        inside  = min(max(qx, qy), 0.0)
+        return float(outside + inside)
+
+    def is_collision(self, pos: np.ndarray) -> bool:
+        return self.distance_from_surface(pos) < 0.0
+
+    def is_in_safety_zone(self, pos: np.ndarray) -> bool:
+        return self.distance_from_surface(pos) < self.safety_margin
 
 
 class MPPIController:
@@ -149,31 +177,22 @@ class MPPIController:
             velocity_cost = self.Q_velocity * np.linalg.norm(velocity) ** 2
             cost += velocity_cost
 
-            # Obstacle avoidance cost using inflated obstacles
+            # Obstacle avoidance cost using signed distance field
             pos = state[:2]
             for obstacle in obstacles:
-                obstacle_pos = np.array([obstacle.x, obstacle.y])
-                distance = np.linalg.norm(pos - obstacle_pos)
+                dist = obstacle.distance_from_surface(pos)
 
-                inflated_radius = obstacle.inflated_radius # Use inflated radius as the hard boundary
-
-                if distance < inflated_radius: # Check if inside the inflated obstacle (safety zone)
-                    penetration = inflated_radius - distance
-
-                    # Quadratic penalty that grows rapidly as we get closer
-                    obstacle_cost = self.Q_obstacle * (penetration**2)
+                if dist < obstacle.safety_margin:  # inside safety zone
+                    penetration = obstacle.safety_margin - dist
+                    obstacle_cost = self.Q_obstacle * (penetration ** 2)
                     cost += obstacle_cost
 
-                    # Additional exponential penalty for being very close to actual obstacle
-                    if (
-                        distance < obstacle.radius + 0.1
-                    ):  # Very close to actual obstacle
-                        collision_penalty += 2000.0 * np.exp(
-                            -10 * (distance - obstacle.radius)
-                        )
+                    # Extra exponential penalty very close to the surface
+                    if dist < 0.1:
+                        collision_penalty += 2000.0 * np.exp(-10 * max(dist, 0.0))
 
-                # Add massive penalty for actual collision with original obstacle
-                if distance < obstacle.radius:
+                # Massive penalty for actual collision
+                if dist < 0.0:
                     collision_penalty += 10000.0
 
         # total collision penalty
@@ -195,10 +214,7 @@ class MPPIController:
         for t in range(len(trajectory)):
             pos = trajectory[t, :2]
             for obstacle in obstacles:
-                obstacle_pos = np.array([obstacle.x, obstacle.y])
-                distance = np.linalg.norm(pos - obstacle_pos)
-
-                if distance < obstacle.inflated_radius:
+                if obstacle.is_in_safety_zone(pos):
                     return True
         return False
 
@@ -293,8 +309,103 @@ class MPPIController:
 class MPPISimulation:
     """Simulation environment for MPPI with inflated obstacle safety margins"""
 
-    def __init__(self, safety_margin: float = 0.2):
+    @staticmethod
+    def generate_random_obstacles(
+        num_obstacles: Optional[int] = None,
+        shape: str = "mixed",
+        x_range: Tuple[float, float] = (0.5, 7.5),
+        y_range: Tuple[float, float] = (0.5, 7.5),
+        radius_range: Tuple[float, float] = (0.3, 1.0),
+        safety_margin: float = 0.2,
+        start: np.ndarray = None,
+        goal: np.ndarray = None,
+        min_clearance: float = 1.2,
+    ) -> List[Obstacle]:
+        """
+        Generate a random set of obstacles for each simulation run.
+
+        Args:
+            num_obstacles: Number of obstacles (random 3-8 if None)
+            shape: "circle", "rectangle", or "mixed" (random per obstacle)
+            x_range: (min, max) x placement range
+            y_range: (min, max) y placement range
+            radius_range: (min, max) size — radius for circles, half-extent for rectangles
+            safety_margin: Safety margin added to each obstacle
+            start: Start position [x, y] — obstacles stay clear of this
+            goal: Goal position [x, y] — obstacles stay clear of this
+            min_clearance: Minimum gap between obstacle edge and start/goal
+
+        Returns:
+            List of Obstacle objects
+        """
+        if start is None:
+            start = np.array([0.0, 0.0])
+        if goal is None:
+            goal = np.array([8.0, 8.0])
+        if num_obstacles is None:
+            num_obstacles = np.random.randint(3, 9)  # 3 to 8 obstacles
+
+        valid_shapes = ("circle", "rectangle", "mixed")
+        if shape not in valid_shapes:
+            raise ValueError(f"shape must be one of {valid_shapes}, got '{shape}'")
+
+        obstacles = []
+        max_attempts = 300
+
+        for _ in range(num_obstacles):
+            # Pick shape for this obstacle
+            obs_shape = shape if shape != "mixed" else np.random.choice(["circle", "rectangle"])
+
+            for _ in range(max_attempts):
+                x = np.random.uniform(*x_range)
+                y = np.random.uniform(*y_range)
+                r = np.random.uniform(*radius_range)  # half-extent
+
+                # Build a candidate obstacle to use its SDF for clearance checks
+                if obs_shape == "circle":
+                    candidate = Obstacle(x, y, r, safety_margin, shape="circle")
+                else:
+                    w = r * 2 * np.random.uniform(0.8, 2.0)  # random aspect ratio
+                    h = r * 2 * np.random.uniform(0.8, 2.0)
+                    candidate = Obstacle(x, y, r, safety_margin, shape="rectangle",
+                                         width=w, height=h)
+
+                # Keep clear of start and goal
+                if candidate.distance_from_surface(start) < min_clearance:
+                    continue
+                if candidate.distance_from_surface(goal) < min_clearance:
+                    continue
+
+                # Keep clear of existing obstacles (0.3 m gap between surfaces)
+                overlap = any(
+                    candidate.distance_from_surface(np.array([obs.x, obs.y])) < 0.3
+                    for obs in obstacles
+                )
+                if overlap:
+                    continue
+
+                obstacles.append(candidate)
+                break  # placed successfully
+
+        return obstacles
+
+    def __init__(
+        self,
+        safety_margin: float = 0.2,
+        output_dir: str = "output",
+        num_obstacles: Optional[int] = None,
+        obstacle_shape: str = "mixed",
+    ):
+        """
+        Args:
+            safety_margin: Safety margin added to all obstacles.
+            output_dir: Directory for saved plots/animations.
+            num_obstacles: Number of obstacles to place (random 3-8 if None).
+            obstacle_shape: "circle", "rectangle", or "mixed".
+        """
         self.safety_margin = safety_margin
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
         self.controller = MPPIController(
             horizon=20,
             num_samples=100,
@@ -307,13 +418,13 @@ class MPPISimulation:
         self.state = np.array([0.0, 0.0, 0.0, 0.0])  # Start at origin
         self.goal = np.array([8.0, 8.0])  # Goal position
 
-        self.obstacles = [
-            Obstacle(2.5, 2.0, 0.6, safety_margin),
-            Obstacle(5.0, 4.0, 0.8, safety_margin),
-            Obstacle(3.0, 6.0, 0.5, safety_margin),
-            Obstacle(6.5, 2.5, 0.7, safety_margin),
-            Obstacle(6.0, 6.5, 0.6, safety_margin),
-        ]
+        self.obstacles = MPPISimulation.generate_random_obstacles(
+            num_obstacles=num_obstacles,
+            shape=obstacle_shape,
+            safety_margin=safety_margin,
+            start=self.state[:2],
+            goal=self.goal,
+        )
 
         # Simulation history
         self.history = []
@@ -321,6 +432,57 @@ class MPPISimulation:
         self.cost_history = []
         self.rollout_history = []
         self.safety_violations = []  # Track when robot enters safety margins
+
+    # ------------------------------------------------------------------
+    # Drawing helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _draw_obstacle_patches(
+        ax,
+        obstacle: "Obstacle",
+        show_safety: bool = False,
+        label_obs: str = "",
+        label_safety: str = "",
+    ):
+        """Add obstacle patch (and optional safety-zone patch) to *ax*."""
+        if obstacle.shape == "circle":
+            if show_safety:
+                ax.add_patch(patches.Circle(
+                    (obstacle.x, obstacle.y), obstacle.inflated_radius,
+                    color="pink", alpha=0.3, label=label_safety,
+                ))
+            ax.add_patch(patches.Circle(
+                (obstacle.x, obstacle.y), obstacle.radius,
+                color="red", alpha=0.7, label=label_obs,
+            ))
+        else:  # rectangle
+            hw = obstacle.width  / 2.0
+            hh = obstacle.height / 2.0
+            sm = obstacle.safety_margin
+            if show_safety:
+                ax.add_patch(patches.Rectangle(
+                    (obstacle.x - hw - sm, obstacle.y - hh - sm),
+                    obstacle.width + 2 * sm, obstacle.height + 2 * sm,
+                    color="pink", alpha=0.3, label=label_safety,
+                ))
+            ax.add_patch(patches.Rectangle(
+                (obstacle.x - hw, obstacle.y - hh),
+                obstacle.width, obstacle.height,
+                color="red", alpha=0.7, label=label_obs,
+            ))
+
+    def _draw_all_obstacles(self, ax, show_safety: bool = False):
+        """Draw every obstacle onto *ax*, labelling only the first."""
+        for i, obs in enumerate(self.obstacles):
+            label_obs    = "Actual Obstacle" if i == 0 else ""
+            label_safety = "Safety Margin"   if i == 0 else ""
+            self._draw_obstacle_patches(ax, obs,
+                                        show_safety=show_safety,
+                                        label_obs=label_obs,
+                                        label_safety=label_safety)
+
+    # ------------------------------------------------------------------
 
     def run_simulation(self, max_steps: int = 200) -> bool:
         """
@@ -336,10 +498,11 @@ class MPPISimulation:
         print(f"Number of obstacles: {len(self.obstacles)}")
 
         for i, obs in enumerate(self.obstacles):
-            print(
-                f"Obstacle {i + 1}: center=({obs.x:.1f}, {obs.y:.1f}), "
-                f"radius={obs.radius:.1f}, inflated_radius={obs.inflated_radius:.1f}"
-            )
+            if obs.shape == "circle":
+                desc = f"radius={obs.radius:.2f}, inflated_radius={obs.inflated_radius:.2f}"
+            else:
+                desc = f"width={obs.width:.2f}, height={obs.height:.2f}"
+            print(f"Obstacle {i + 1} [{obs.shape}]: center=({obs.x:.1f}, {obs.y:.1f}), {desc}")
 
         for step in range(max_steps):
             control, best_trajectory, costs = self.controller.update_control(
@@ -365,14 +528,11 @@ class MPPISimulation:
             actual_collision = False
 
             for obstacle in self.obstacles:
-                distance = np.linalg.norm(
-                    self.state[:2] - np.array([obstacle.x, obstacle.y])
-                )
-
-                if distance < obstacle.radius:
+                dist = obstacle.distance_from_surface(self.state[:2])
+                if dist < 0.0:
                     actual_collision = True
                     break
-                elif distance < obstacle.inflated_radius:
+                elif dist < obstacle.safety_margin:
                     safety_violation = True
 
             self.safety_violations.append(safety_violation)
@@ -429,24 +589,7 @@ class MPPISimulation:
         ax1.set_ylabel("Y Position")
         ax1.grid(True, alpha=0.3)
 
-        for obstacle in self.obstacles:
-            safety_circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.inflated_radius,
-                color="pink",
-                alpha=0.3,
-                label="Safety Margin" if obstacle == self.obstacles[0] else "",
-            )
-            ax1.add_patch(safety_circle)
-
-            obstacle_circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.radius,
-                color="red",
-                alpha=0.7,
-                label="Actual Obstacle" if obstacle == self.obstacles[0] else "",
-            )
-            ax1.add_patch(obstacle_circle)
+        self._draw_all_obstacles(ax1, show_safety=True)
 
         ax1.plot(self.goal[0], self.goal[1], "r*", markersize=15, label="Goal")
 
@@ -473,10 +616,10 @@ class MPPISimulation:
             for t in range(len(traj)):
                 pos = traj[t, :2]
                 for obstacle in self.obstacles:
-                    distance = np.linalg.norm(pos - np.array([obstacle.x, obstacle.y]))
-                    if distance < obstacle.radius:
+                    dist = obstacle.distance_from_surface(pos)
+                    if dist < 0.0:
                         has_collision = True
-                    elif distance < obstacle.inflated_radius:
+                    elif dist < obstacle.safety_margin:
                         has_safety_violation = True
 
             if has_collision:
@@ -581,6 +724,9 @@ class MPPISimulation:
         ax2.legend()
 
         plt.tight_layout()
+        save_path = os.path.join(self.output_dir, f"rollouts_timestep_{timestep}.png")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {save_path}")
         plt.show()
 
     def plot_results(self):
@@ -593,16 +739,7 @@ class MPPISimulation:
         ax1.set_ylabel("Y Position")
         ax1.grid(True, alpha=0.3)
 
-        # Plot obstacles
-        for obstacle in self.obstacles:
-            circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.radius,
-                color="red",
-                alpha=0.7,
-                label="Obstacle" if obstacle == self.obstacles[0] else "",
-            )
-            ax1.add_patch(circle)
+        self._draw_all_obstacles(ax1, show_safety=False)
 
         # Plot trajectory
         if self.history:
@@ -663,6 +800,9 @@ class MPPISimulation:
             ax4.set_yscale("log")
 
         plt.tight_layout()
+        save_path = os.path.join(self.output_dir, "results.png")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {save_path}")
         plt.show()
 
     def plot_safety_analysis(self):
@@ -675,27 +815,7 @@ class MPPISimulation:
         ax1.set_ylabel("Y Position")
         ax1.grid(True, alpha=0.3)
 
-        # Plot safety zones and obstacles
-        for obstacle in self.obstacles:
-            # Safety zone
-            safety_circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.inflated_radius,
-                color="pink",
-                alpha=0.3,
-                label="Safety Margin" if obstacle == self.obstacles[0] else "",
-            )
-            ax1.add_patch(safety_circle)
-
-            # Original obstacle
-            obstacle_circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.radius,
-                color="red",
-                alpha=0.7,
-                label="Actual Obstacle" if obstacle == self.obstacles[0] else "",
-            )
-            ax1.add_patch(obstacle_circle)
+        self._draw_all_obstacles(ax1, show_safety=True)
 
         # Plot executed trajectory with safety violation highlighting
         if self.history:
@@ -800,13 +920,9 @@ class MPPISimulation:
                 min_dist_inflated = float("inf")
 
                 for obstacle in self.obstacles:
-                    obs_pos = np.array([obstacle.x, obstacle.y])
-                    dist = np.linalg.norm(pos - obs_pos)
-
-                    min_dist_actual = min(min_dist_actual, dist - obstacle.radius)
-                    min_dist_inflated = min(
-                        min_dist_inflated, dist - obstacle.inflated_radius
-                    )
+                    sdf = obstacle.distance_from_surface(pos)
+                    min_dist_actual   = min(min_dist_actual,   sdf)
+                    min_dist_inflated = min(min_dist_inflated, sdf - obstacle.safety_margin)
 
                 min_distances_actual.append(max(0, min_dist_actual))
                 min_distances_inflated.append(min_dist_inflated)
@@ -858,6 +974,9 @@ class MPPISimulation:
             ax4.legend()
 
         plt.tight_layout()
+        save_path = os.path.join(self.output_dir, "safety_analysis.png")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {save_path}")
         plt.show()
 
     def animate_simulation(self, save_animation: bool = False):
@@ -874,13 +993,7 @@ class MPPISimulation:
             ax.grid(True, alpha=0.3)
             ax.set_title("MPPI Robot Navigation with Obstacle Avoidance")
 
-            # Plot static elements (original style)
-            for obstacle in self.obstacles:
-                circle = patches.Circle(
-                    (obstacle.x, obstacle.y), obstacle.radius, color="red", alpha=0.7
-                )
-                ax.add_patch(circle)
-
+            self._draw_all_obstacles(ax, show_safety=False)
             ax.plot(self.goal[0], self.goal[1], "r*", markersize=15, label="Goal")
 
             # Initialize dynamic elements
@@ -924,8 +1037,9 @@ class MPPISimulation:
             if save_animation:
                 try:
                     print("Saving animation... (this may take a while)")
-                    anim.save("mppi_obstacle_avoidance.gif", writer="pillow", fps=10)
-                    print("Animation saved as 'mppi_obstacle_avoidance.gif'")
+                    save_path = os.path.join(self.output_dir, "mppi_obstacle_avoidance.gif")
+                    anim.save(save_path, writer="pillow", fps=10)
+                    print(f"Saved: {save_path}")
                 except Exception as e:
                     print(f"Failed to save animation: {e}")
 
@@ -960,12 +1074,7 @@ class MPPISimulation:
             ax.grid(True, alpha=0.3)
             ax.set_title(f"Step {step_idx} / {n_steps - 1}")
 
-            # Plot obstacles (original style)
-            for obstacle in self.obstacles:
-                circle = patches.Circle(
-                    (obstacle.x, obstacle.y), obstacle.radius, color="red", alpha=0.7
-                )
-                ax.add_patch(circle)
+            self._draw_all_obstacles(ax, show_safety=False)
 
             # Plot goal
             ax.plot(self.goal[0], self.goal[1], "r*", markersize=15, label="Goal")
@@ -1006,6 +1115,9 @@ class MPPISimulation:
         plt.suptitle(
             "MPPI Robot Navigation - Step by Step Progress", y=1.02, fontsize=16
         )
+        save_path = os.path.join(self.output_dir, "step_by_step.png")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {save_path}")
         plt.show()
 
     def create_interactive_plot(self):
@@ -1022,16 +1134,7 @@ class MPPISimulation:
         ax.set_aspect("equal")
         ax.grid(True, alpha=0.3)
 
-        # Plot obstacles (original style)
-        for obstacle in self.obstacles:
-            circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.radius,
-                color="red",
-                alpha=0.7,
-                label="Obstacle" if obstacle == self.obstacles[0] else "",
-            )
-            ax.add_patch(circle)
+        self._draw_all_obstacles(ax, show_safety=False)
 
         # Plot goal
         ax.plot(self.goal[0], self.goal[1], "r*", markersize=15, label="Goal")
@@ -1069,6 +1172,9 @@ class MPPISimulation:
 
         ax.legend()
         ax.set_title("MPPI Robot Navigation - Complete Trajectory")
+        save_path = os.path.join(self.output_dir, "interactive_trajectory.png")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {save_path}")
         plt.show()
 
     def create_rollout_animation(
@@ -1087,22 +1193,7 @@ class MPPISimulation:
         ax.set_aspect("equal")
         ax.grid(True, alpha=0.3)
 
-        # Plot static elements - both safety zones and actual obstacles
-        for obstacle in self.obstacles:
-            # Safety zone
-            safety_circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.inflated_radius,
-                color="pink",
-                alpha=0.2,
-            )
-            ax.add_patch(safety_circle)
-            # Actual obstacle
-            obstacle_circle = patches.Circle(
-                (obstacle.x, obstacle.y), obstacle.radius, color="red", alpha=0.7
-            )
-            ax.add_patch(obstacle_circle)
-
+        self._draw_all_obstacles(ax, show_safety=True)
         ax.plot(self.goal[0], self.goal[1], "r*", markersize=15, label="Goal")
 
         # Initialize dynamic elements
@@ -1182,8 +1273,9 @@ class MPPISimulation:
         if save_animation:
             try:
                 print("Saving rollout animation...")
-                anim.save("mppi_rollouts_safety.gif", writer="pillow", fps=5)
-                print("Animation saved as 'mppi_rollouts_safety.gif'")
+                save_path = os.path.join(self.output_dir, "mppi_rollouts_safety.gif")
+                anim.save(save_path, writer="pillow", fps=5)
+                print(f"Saved: {save_path}")
             except Exception as e:
                 print(f"Failed to save animation: {e}")
 
@@ -1204,15 +1296,7 @@ class MPPISimulation:
         ax1.set_ylabel("Y Position")
         ax1.grid(True, alpha=0.3)
 
-        for obstacle in self.obstacles:
-            circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.radius,
-                color="red",
-                alpha=0.7,
-                label="Obstacle" if obstacle == self.obstacles[0] else "",
-            )
-            ax1.add_patch(circle)
+        self._draw_all_obstacles(ax1, show_safety=False)
 
         if self.history:
             trajectory = np.array(self.history)
@@ -1237,26 +1321,7 @@ class MPPISimulation:
         ax2.set_ylabel("Y Position")
         ax2.grid(True, alpha=0.3)
 
-        for obstacle in self.obstacles:
-            # Safety zone
-            safety_circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.inflated_radius,
-                color="pink",
-                alpha=0.3,
-                label="Safety Margin" if obstacle == self.obstacles[0] else "",
-            )
-            ax2.add_patch(safety_circle)
-
-            # Original obstacle
-            obstacle_circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.radius,
-                color="red",
-                alpha=0.7,
-                label="Actual Obstacle" if obstacle == self.obstacles[0] else "",
-            )
-            ax2.add_patch(obstacle_circle)
+        self._draw_all_obstacles(ax2, show_safety=True)
 
         if self.history:
             trajectory = np.array(self.history)
@@ -1314,6 +1379,9 @@ class MPPISimulation:
         ax2.set_aspect("equal")
 
         plt.tight_layout()
+        save_path = os.path.join(self.output_dir, "safety_comparison.png")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {save_path}")
         plt.show()
 
     def create_detailed_safety_analysis(self):
@@ -1330,19 +1398,7 @@ class MPPISimulation:
         ax1.set_ylabel("Y Position")
         ax1.grid(True, alpha=0.3)
 
-        # Plot obstacles
-        for obstacle in self.obstacles:
-            safety_circle = patches.Circle(
-                (obstacle.x, obstacle.y),
-                obstacle.inflated_radius,
-                color="pink",
-                alpha=0.2,
-            )
-            ax1.add_patch(safety_circle)
-            obstacle_circle = patches.Circle(
-                (obstacle.x, obstacle.y), obstacle.radius, color="red", alpha=0.7
-            )
-            ax1.add_patch(obstacle_circle)
+        self._draw_all_obstacles(ax1, show_safety=True)
 
         if self.history:
             trajectory = np.array(self.history)
@@ -1354,10 +1410,7 @@ class MPPISimulation:
                 min_safety_distance = float("inf")
 
                 for obstacle in self.obstacles:
-                    obs_pos = np.array([obstacle.x, obstacle.y])
-                    safety_dist = (
-                        np.linalg.norm(pos - obs_pos) - obstacle.inflated_radius
-                    )
+                    safety_dist = obstacle.distance_from_surface(pos) - obstacle.safety_margin
                     min_safety_distance = min(min_safety_distance, safety_dist)
 
                 # Violation intensity: how deep into safety zone
@@ -1398,17 +1451,13 @@ class MPPISimulation:
                 min_safety_boundary = float("inf")
 
                 for obstacle in self.obstacles:
-                    obs_pos = np.array([obstacle.x, obstacle.y])
-                    dist = np.linalg.norm(pos - obs_pos)
-
-                    clearance = dist - obstacle.radius
-                    safety_boundary_dist = dist - obstacle.inflated_radius
-
-                    min_clearance = min(min_clearance, clearance)
+                    sdf = obstacle.distance_from_surface(pos)
+                    safety_boundary_dist = sdf - obstacle.safety_margin
+                    min_clearance = min(min_clearance, sdf)
                     min_safety_boundary = min(min_safety_boundary, safety_boundary_dist)
 
                 min_clearances.append(max(0, min_clearance))
-                safety_boundaries.append(safety_boundary_dist)
+                safety_boundaries.append(min_safety_boundary)
 
             ax2.plot(
                 min_clearances, "b-", linewidth=2, label="Clearance from Obstacles"
@@ -1457,16 +1506,16 @@ class MPPISimulation:
             for i, obstacle in enumerate(self.obstacles):
                 distances = []
                 for state in self.history:
-                    pos = state[:2]
-                    obs_pos = np.array([obstacle.x, obstacle.y])
-                    dist = np.linalg.norm(pos - obs_pos) - obstacle.radius
-                    distances.append(max(0, dist))
+                    dist = obstacle.distance_from_surface(state[:2])
+                    distances.append(max(0.0, dist))
 
+                size_label = (f"r={obstacle.radius:.1f}" if obstacle.shape == "circle"
+                              else f"w={obstacle.width:.1f},h={obstacle.height:.1f}")
                 ax3.plot(
                     distances,
                     color=colors[i],
                     linewidth=2,
-                    label=f"Obstacle {i + 1} (r={obstacle.radius:.1f})",
+                    label=f"Obstacle {i + 1} [{obstacle.shape}] ({size_label})",
                 )
 
                 # Show safety margin for this obstacle
@@ -1502,23 +1551,79 @@ class MPPISimulation:
             ax4_twin.set_yscale("log")
 
         plt.tight_layout()
+        save_path = os.path.join(self.output_dir, "detailed_safety_analysis.png")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {save_path}")
         plt.show()
 
 
 def main():
-    """Main function demonstrating all visualization capabilities"""
+    """Main function demonstrating all visualization capabilities."""
+    parser = argparse.ArgumentParser(
+        description="MPPI Controller with random obstacle generation"
+    )
+    parser.add_argument(
+        "-n", "--num-obstacles",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of obstacles to place (default: random 3-8 each run)",
+    )
+    parser.add_argument(
+        "-s", "--shape",
+        choices=["circle", "rectangle", "mixed"],
+        default="mixed",
+        help="Obstacle shape: circle, rectangle, or mixed (default: mixed)",
+    )
+    parser.add_argument(
+        "--safety-margin",
+        type=float,
+        default=0.2,
+        metavar="M",
+        help="Safety margin in metres added to every obstacle (default: 0.2)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible layouts (default: different each run)",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=150,
+        help="Maximum simulation steps (default: 150)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="output",
+        help="Directory to save plots and animations (default: output)",
+    )
+    args = parser.parse_args()
+
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        print(f"Random seed: {args.seed}")
+
     print("=" * 60)
     print("MPPI Controller with Comprehensive Visualization")
     print("Including Original Plots + Enhanced Safety Analysis")
     print("=" * 60)
+    print(f"Obstacles : {args.num_obstacles if args.num_obstacles else 'random 3-8'}")
+    print(f"Shape     : {args.shape}")
+    print(f"Safety    : {args.safety_margin} m")
 
-    # Create and run simulation
-    safety_margin = 0.2
-    sim = MPPISimulation(safety_margin=safety_margin)
+    sim = MPPISimulation(
+        safety_margin=args.safety_margin,
+        output_dir=args.output_dir,
+        num_obstacles=args.num_obstacles,
+        obstacle_shape=args.shape,
+    )
+    print(f"Plots and animations will be saved to: {os.path.abspath(sim.output_dir)}")
 
-    print(f"\nRunning simulation with safety margin: {safety_margin}")
+    print(f"\nRunning simulation with safety margin: {args.safety_margin}")
     start_time = time.time()
-    success = sim.run_simulation(max_steps=150)
+    success = sim.run_simulation(max_steps=args.max_steps)
     end_time = time.time()
 
     print(f"\nSimulation completed in {end_time - start_time:.2f} seconds")
@@ -1529,15 +1634,11 @@ def main():
         final_distance = np.linalg.norm(final_state[:2] - sim.goal)
         print(f"Final distance to goal: {final_distance:.3f}")
 
-        # Calculate minimum distance to any obstacle during trajectory
-        min_clearance = float("inf")
-        for state in sim.history:
-            pos = state[:2]
-            for obstacle in sim.obstacles:
-                obs_pos = np.array([obstacle.x, obstacle.y])
-                clearance = np.linalg.norm(pos - obs_pos) - obstacle.radius
-                min_clearance = min(min_clearance, clearance)
-
+        min_clearance = min(
+            obstacle.distance_from_surface(state[:2])
+            for state in sim.history
+            for obstacle in sim.obstacles
+        )
         print(f"Minimum clearance from obstacles: {min_clearance:.3f}")
         print(
             f"Safety violations: {sum(sim.safety_violations)} out of {len(sim.safety_violations)} steps"
@@ -1572,14 +1673,14 @@ def main():
     # 4. Original animation
     print("\n4. Original Simulation Animation")
     try:
-        anim1 = sim.animate_simulation(save_animation=False)
+        anim1 = sim.animate_simulation(save_animation=True)
     except Exception as e:
         print(f"Original animation failed: {e}")
 
     # 5. Enhanced rollout animation with safety zones
     print("\n5. Rollout Evolution Animation with Safety Zones")
     try:
-        anim2 = sim.create_rollout_animation(save_animation=False, max_rollouts=30)
+        anim2 = sim.create_rollout_animation(save_animation=True, max_rollouts=30)
     except Exception as e:
         print(f"Rollout animation failed: {e}")
 
