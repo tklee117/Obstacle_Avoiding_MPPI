@@ -457,6 +457,7 @@ class Go2Simulator:
                 renderer = None
 
         goal_reached = False
+        rollout_history = []   # list of dicts — one entry per MPPI replan
         t_start = time.time()
 
         print(f"Starting simulation (warmup={warmup_time}s, max={max_time}s) …")
@@ -476,6 +477,13 @@ class Go2Simulator:
                 state = np.array([pos_x, pos_y, yaw, vel_x, vel_y])
                 u_opt, _, _ = mppi.update_control(state, goal, obstacles)
                 cmd_vx, cmd_vy, cmd_yaw = u_opt  # u_opt is already U[0], shape (3,)
+
+                # Capture rollout snapshot for the 2-D animation
+                rollout_history.append({
+                    "trajectories": [t.copy() for t in mppi.last_sampled_trajectories],
+                    "weights":      mppi.last_weights.copy(),
+                    "current_pos":  np.array([pos_x, pos_y]),
+                })
 
                 # Feed velocity commands into the 15-dim command vector
                 self.commands[0] = float(np.clip(cmd_vx,  -1.5, 1.5))
@@ -527,14 +535,16 @@ class Go2Simulator:
         print(f"Simulation finished in {total_wall:.1f}s real time.")
         print(f"Goal reached: {goal_reached}   Trajectory points: {len(traj_xy)}")
 
-        self._save_results(traj_xy, cmd_log, obstacles, goal, frames, output_dir)
+        self._save_results(traj_xy, cmd_log, obstacles, goal, frames, rollout_history, output_dir)
         return traj_xy, goal_reached
 
     # ── output generation ─────────────────────────────────────────────
 
-    def _save_results(self, traj_xy, cmd_log, obstacles, goal, frames, output_dir):
-        """Save trajectory plot and (if available) video."""
+    def _save_results(self, traj_xy, cmd_log, obstacles, goal, frames, rollout_history, output_dir):
+        """Save trajectory plot, rollout GIF, and (if available) MuJoCo video."""
         self._save_trajectory_plot(traj_xy, cmd_log, obstacles, goal, output_dir)
+        if rollout_history:
+            self._save_rollout_gif(traj_xy, rollout_history, obstacles, goal, output_dir)
         if frames:
             self._save_video(frames, output_dir)
 
@@ -596,6 +606,113 @@ class Go2Simulator:
         fig.savefig(path, dpi=150, bbox_inches="tight")
         print(f"Saved: {path}")
         plt.close(fig)
+
+    def _save_rollout_gif(self, traj_xy, rollout_history, obstacles, goal,
+                          output_dir, max_rollouts: int = 50):
+        """
+        Create a 2-D top-down GIF showing how MPPI sampled trajectories evolve
+        over time — analogous to create_rollout_animation in mppi_hard_constraint.py.
+
+        Each frame = one MPPI replan step.
+        Trajectories are coloured by weight (plasma); the executed path grows in green.
+        """
+        import imageio
+        from matplotlib.animation import FuncAnimation
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+
+        # Determine plot bounds from obstacles + goal + trajectory
+        all_x = np.concatenate([traj_xy[:, 0], [o.x for o in obstacles], [goal[0]]])
+        all_y = np.concatenate([traj_xy[:, 1], [o.y for o in obstacles], [goal[1]]])
+        pad = 1.5
+        ax.set_xlim(all_x.min() - pad, all_x.max() + pad)
+        ax.set_ylim(all_y.min() - pad, all_y.max() + pad)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+
+        # Static elements: obstacles and goal
+        for i, obs in enumerate(obstacles):
+            MPPISimulation._draw_obstacle_patches(
+                ax, obs, show_safety=True,
+                label_obs="Obstacle"     if i == 0 else "",
+                label_safety="Safety zone" if i == 0 else "",
+            )
+        ax.plot(goal[0], goal[1], "r*", markersize=14, label="Goal", zorder=6)
+
+        # Dynamic line handles — pre-allocate rollout lines
+        rollout_lines = [ax.plot([], [], alpha=0.4, linewidth=1)[0]
+                         for _ in range(max_rollouts)]
+        (robot,) = ax.plot([], [], "ko", markersize=10,
+                           markerfacecolor="white", markeredgewidth=2.5,
+                           label="Robot", zorder=7)
+        (exec_path,) = ax.plot([], [], "g-", linewidth=3, alpha=0.85,
+                               label="Executed path", zorder=5)
+
+        ax.legend(loc="upper left", fontsize=8)
+        title = ax.set_title("")
+
+        def _animate(frame):
+            data       = rollout_history[frame]
+            trajs      = data["trajectories"]
+            weights    = data["weights"]
+            cur_pos    = data["current_pos"]
+
+            # Pick up to max_rollouts trajectories, sorted by weight (low→high)
+            idx = np.argsort(weights)
+            if len(idx) > max_rollouts:
+                step = len(idx) // max_rollouts
+                idx = idx[::step]
+
+            colors = plt.cm.plasma(np.linspace(0, 1, len(idx)))
+            w_max  = np.max(weights) if np.max(weights) > 0 else 1.0
+
+            for i, line in enumerate(rollout_lines):
+                if i < len(idx):
+                    traj = trajs[idx[i]]
+                    w    = weights[idx[i]]
+                    line.set_data(traj[:, 0], traj[:, 1])
+                    line.set_color(colors[i])
+                    line.set_alpha(0.15 + 0.65 * (w / w_max))
+                else:
+                    line.set_data([], [])
+
+            robot.set_data([cur_pos[0]], [cur_pos[1]])
+
+            if frame > 0:
+                exec_path.set_data(traj_xy[:frame, 0], traj_xy[:frame, 1])
+
+            eff = 1.0 / np.sum(weights ** 2) if np.sum(weights ** 2) > 0 else 0
+            title.set_text(
+                f"MPPI Rollouts — step {frame}/{len(rollout_history)-1}"
+                f"   ESS={eff:.1f}/{len(weights)}"
+            )
+            return rollout_lines + [robot, exec_path, title]
+
+        anim = FuncAnimation(
+            fig, _animate,
+            frames=len(rollout_history),
+            interval=200, blit=False, repeat=True,
+        )
+
+        gif_path = os.path.join(output_dir, "go2_mppi_rollouts.gif")
+        try:
+            print("Saving rollout GIF …")
+            # Render each frame to a numpy array and write with imageio
+            frames_out = []
+            for i in range(len(rollout_history)):
+                _animate(i)
+                fig.canvas.draw()
+                w_px, h_px = fig.canvas.get_width_height()
+                img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                frames_out.append(img.reshape(h_px, w_px, 3))
+            imageio.mimsave(gif_path, frames_out, fps=5, loop=0)
+            print(f"Saved rollout GIF: {gif_path}")
+        except Exception as e:
+            print(f"Rollout GIF save failed: {e}")
+        finally:
+            plt.close(fig)
 
     def _save_video(self, frames, output_dir):
         import imageio
