@@ -41,7 +41,7 @@ import matplotlib.patches as mpatches
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
-from mppi_hard_constraint import Obstacle
+from mppi_hard_constraint import Obstacle, MPPISimulation
 from mppi_go2 import MPPIGo2Controller
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -215,16 +215,39 @@ def _build_scene_xml(obstacles, goal: np.ndarray) -> str:
         xml = fh.read()
 
     inject = ""
+    h = 0.5   # visual obstacle half-height (metres) — kept low so the dog is visible
     for i, obs in enumerate(obstacles):
-        h = 1.5  # visual cylinder half-height (metres)
-        r_phys = obs.radius
-        r_safe = obs.inflated_radius
+        if obs.shape == "circle":
+            r_phys = obs.radius
+            r_safe = obs.inflated_radius
+            body_geom = (
+                f'<geom name="obs_{i}_body" type="cylinder" '
+                f'size="{r_phys:.4f} {h:.4f}" '
+                f'rgba="0.85 0.15 0.10 0.85" contype="0" conaffinity="0"/>'
+            )
+            safe_geom = (
+                f'<geom name="obs_{i}_safe" type="cylinder" '
+                f'size="{r_safe:.4f} {h:.4f}" '
+                f'rgba="1.00 0.55 0.10 0.18" contype="0" conaffinity="0"/>'
+            )
+        else:  # rectangle → MuJoCo box geom
+            hw = obs.width  / 2.0
+            hh_rect = obs.height / 2.0
+            sm = obs.safety_margin
+            body_geom = (
+                f'<geom name="obs_{i}_body" type="box" '
+                f'size="{hw:.4f} {hh_rect:.4f} {h:.4f}" '
+                f'rgba="0.85 0.15 0.10 0.85" contype="0" conaffinity="0"/>'
+            )
+            safe_geom = (
+                f'<geom name="obs_{i}_safe" type="box" '
+                f'size="{hw+sm:.4f} {hh_rect+sm:.4f} {h:.4f}" '
+                f'rgba="1.00 0.55 0.10 0.18" contype="0" conaffinity="0"/>'
+            )
         inject += f"""
     <body name="obs_{i}" pos="{obs.x} {obs.y} {h}">
-      <geom name="obs_{i}_body" type="cylinder" size="{r_phys:.4f} {h:.4f}"
-            rgba="0.85 0.15 0.10 0.85" contype="0" conaffinity="0"/>
-      <geom name="obs_{i}_safe" type="cylinder" size="{r_safe:.4f} {h:.4f}"
-            rgba="1.00 0.55 0.10 0.18" contype="0" conaffinity="0"/>
+      {body_geom}
+      {safe_geom}
     </body>"""
 
     # Goal marker: flat disc on the floor
@@ -527,18 +550,12 @@ class Go2Simulator:
         ax_traj.grid(True, alpha=0.3)
 
         for i, obs in enumerate(obstacles):
-            safety = plt.Circle(
-                (obs.x, obs.y), obs.inflated_radius,
-                color="pink", alpha=0.4,
-                label="Safety zone" if i == 0 else "",
+            MPPISimulation._draw_obstacle_patches(
+                ax_traj, obs,
+                show_safety=True,
+                label_obs="Obstacle"    if i == 0 else "",
+                label_safety="Safety zone" if i == 0 else "",
             )
-            phys = plt.Circle(
-                (obs.x, obs.y), obs.radius,
-                color="red", alpha=0.7,
-                label="Obstacle" if i == 0 else "",
-            )
-            ax_traj.add_patch(safety)
-            ax_traj.add_patch(phys)
 
         ax_traj.plot(traj_xy[:, 0], traj_xy[:, 1], "b-", linewidth=2, label="Path")
         ax_traj.plot(traj_xy[0, 0],  traj_xy[0, 1],  "go", markersize=10, label="Start")
@@ -613,26 +630,55 @@ def parse_args():
     p.add_argument("--output-dir",  default=os.path.join(_HERE, "output"),
                    help="Directory for saved plots/video (default: output/)")
     p.add_argument("--render",      action="store_true",
-                   help="Capture offscreen frames and save as mp4")
+                   help="Capture offscreen frames and save as gif/mp4")
     p.add_argument("--samples",     type=int,   default=500,
                    help="MPPI sample count (default: 500)")
     p.add_argument("--horizon",     type=int,   default=20,
                    help="MPPI horizon (default: 20)")
     p.add_argument("--sigma",       type=float, default=0.5,
                    help="MPPI noise sigma (default: 0.5)")
+    # ── obstacle configuration ────────────────────────────────────────────────
+    p.add_argument("-n", "--num-obstacles", type=int, default=None, metavar="N",
+                   help="Number of obstacles (default: random 3-8 each run)")
+    p.add_argument("-s", "--shape",
+                   choices=["circle", "rectangle", "mixed"], default="circle",
+                   help="Obstacle shape: circle, rectangle, or mixed (default: circle)")
+    p.add_argument("--safety-margin", type=float, default=0.5, metavar="M",
+                   help="Safety margin in metres added to every obstacle (default: 0.5)")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Random seed for reproducible obstacle layouts")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        print(f"Random seed: {args.seed}")
+
     # ── scene definition ──────────────────────────────────────────────────────
-    obstacles = [
-        Obstacle(x=2.0, y=1.0, radius=0.4, safety_margin=0.5),
-        Obstacle(x=4.0, y=3.0, radius=0.5, safety_margin=0.5),
-        Obstacle(x=3.0, y=5.0, radius=0.3, safety_margin=0.5),
-    ]
     goal = np.array([6.0, 6.0])
+
+    obstacles = MPPISimulation.generate_random_obstacles(
+        num_obstacles  = args.num_obstacles,
+        shape          = args.shape,
+        safety_margin  = args.safety_margin,
+        start          = np.array([0.0, 0.0]),
+        goal           = goal,
+        x_range        = (0.5, 5.5),
+        y_range        = (0.5, 5.5),
+        radius_range   = (0.3, 0.7),
+        min_clearance  = 1.0,
+    )
+
+    print(f"Obstacles ({len(obstacles)}):")
+    for i, obs in enumerate(obstacles):
+        if obs.shape == "circle":
+            desc = f"radius={obs.radius:.2f}"
+        else:
+            desc = f"width={obs.width:.2f}, height={obs.height:.2f}"
+        print(f"  {i+1}. [{obs.shape}] pos=({obs.x:.2f},{obs.y:.2f})  {desc}  margin={obs.safety_margin}")
 
     # ── MPPI controller ───────────────────────────────────────────────────────
     mppi = MPPIGo2Controller(
@@ -642,7 +688,7 @@ def main():
         lambda_        = 1.0,
         sigma          = args.sigma,
         control_bounds = (-1.5, 1.5),
-        safety_margin  = 0.5,
+        safety_margin  = args.safety_margin,
     )
 
     # ── run ───────────────────────────────────────────────────────────────────
