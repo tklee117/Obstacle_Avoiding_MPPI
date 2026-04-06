@@ -43,6 +43,7 @@ sys.path.insert(0, _HERE)
 
 from mppi_hard_constraint import Obstacle, MPPISimulation
 from mppi_go2 import MPPIGo2Controller
+from global_planner import AStarPlanner
 
 # ── paths ────────────────────────────────────────────────────────────────────
 _HOME = os.path.expanduser("~")
@@ -460,6 +461,25 @@ class Go2Simulator:
         rollout_history = []   # list of dicts — one entry per MPPI replan
         t_start = time.time()
 
+        # ── global A* path ────────────────────────────────────────────────────
+        start_pos = np.array([self.data.qpos[0], self.data.qpos[1]])
+        all_x = [start_pos[0], goal[0]] + [o.x for o in obstacles]
+        all_y = [start_pos[1], goal[1]] + [o.y for o in obstacles]
+        bounds = (
+            min(all_x) - 1.5, max(all_x) + 1.5,
+            min(all_y) - 1.5, max(all_y) + 1.5,
+        )
+        astar = AStarPlanner(
+            obstacles, bounds,
+            resolution=0.15,
+            safety_margin=mppi.safety_margin,
+        )
+        global_path = astar.plan(start_pos, goal)
+        if global_path is None:
+            print("WARNING: A* found no path — falling back to direct goal tracking")
+            global_path = [start_pos, goal]
+        CARROT_LOOKAHEAD = 1.5   # metres ahead of robot on global path
+
         print(f"Starting simulation (warmup={warmup_time}s, max={max_time}s) …")
         print(f"Goal: {goal}   Obstacles: {len(obstacles)}")
 
@@ -474,8 +494,12 @@ class Go2Simulator:
                 vel_x = float(self.data.qvel[0])
                 vel_y = float(self.data.qvel[1])
 
+                # Pure-pursuit carrot on the global path
+                robot_pos = np.array([pos_x, pos_y])
+                carrot = astar.get_carrot(global_path, robot_pos, CARROT_LOOKAHEAD)
+
                 state = np.array([pos_x, pos_y, yaw, vel_x, vel_y])
-                u_opt, _, _ = mppi.update_control(state, goal, obstacles)
+                u_opt, _, _ = mppi.update_control(state, carrot, obstacles)
                 cmd_vx, cmd_vy, cmd_yaw = u_opt  # u_opt is already U[0], shape (3,)
 
                 # Capture rollout snapshot for the 2-D animation
@@ -535,20 +559,20 @@ class Go2Simulator:
         print(f"Simulation finished in {total_wall:.1f}s real time.")
         print(f"Goal reached: {goal_reached}   Trajectory points: {len(traj_xy)}")
 
-        self._save_results(traj_xy, cmd_log, obstacles, goal, frames, rollout_history, output_dir)
+        self._save_results(traj_xy, cmd_log, obstacles, goal, frames, rollout_history, output_dir, global_path)
         return traj_xy, goal_reached
 
     # ── output generation ─────────────────────────────────────────────
 
-    def _save_results(self, traj_xy, cmd_log, obstacles, goal, frames, rollout_history, output_dir):
+    def _save_results(self, traj_xy, cmd_log, obstacles, goal, frames, rollout_history, output_dir, global_path=None):
         """Save trajectory plot, rollout GIF, and (if available) MuJoCo video."""
-        self._save_trajectory_plot(traj_xy, cmd_log, obstacles, goal, output_dir)
+        self._save_trajectory_plot(traj_xy, cmd_log, obstacles, goal, output_dir, global_path)
         if rollout_history:
-            self._save_rollout_gif(traj_xy, rollout_history, obstacles, goal, output_dir)
+            self._save_rollout_gif(traj_xy, rollout_history, obstacles, goal, output_dir, global_path=global_path)
         if frames:
             self._save_video(frames, output_dir)
 
-    def _save_trajectory_plot(self, traj_xy, cmd_log, obstacles, goal, output_dir):
+    def _save_trajectory_plot(self, traj_xy, cmd_log, obstacles, goal, output_dir, global_path=None):
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         ax_traj, ax_cmd, ax_dist = axes
 
@@ -567,7 +591,10 @@ class Go2Simulator:
                 label_safety="Safety zone" if i == 0 else "",
             )
 
-        ax_traj.plot(traj_xy[:, 0], traj_xy[:, 1], "b-", linewidth=2, label="Path")
+        if global_path is not None:
+            gp = np.array(global_path)
+            ax_traj.plot(gp[:, 0], gp[:, 1], "c--", linewidth=1.5, alpha=0.7, label="A* path")
+        ax_traj.plot(traj_xy[:, 0], traj_xy[:, 1], "b-", linewidth=2, label="Executed path")
         ax_traj.plot(traj_xy[0, 0],  traj_xy[0, 1],  "go", markersize=10, label="Start")
         ax_traj.plot(goal[0],         goal[1],         "r*", markersize=15, label="Goal")
         ax_traj.legend(loc="upper left")
@@ -608,7 +635,7 @@ class Go2Simulator:
         plt.close(fig)
 
     def _save_rollout_gif(self, traj_xy, rollout_history, obstacles, goal,
-                          output_dir, max_rollouts: int = 50):
+                          output_dir, max_rollouts: int = 50, global_path=None):
         """
         Create a 2-D top-down GIF showing how MPPI sampled trajectories evolve
         over time — analogous to create_rollout_animation in mppi_hard_constraint.py.
@@ -640,6 +667,9 @@ class Go2Simulator:
                 label_safety="Safety zone" if i == 0 else "",
             )
         ax.plot(goal[0], goal[1], "r*", markersize=14, label="Goal", zorder=6)
+        if global_path is not None:
+            gp = np.array(global_path)
+            ax.plot(gp[:, 0], gp[:, 1], "c--", linewidth=1.5, alpha=0.7, label="A* path", zorder=4)
 
         # Dynamic line handles — pre-allocate rollout lines
         rollout_lines = [ax.plot([], [], alpha=0.4, linewidth=1)[0]
@@ -756,10 +786,10 @@ def parse_args():
                    help="Capture offscreen frames and save as gif/mp4")
     p.add_argument("--samples",     type=int,   default=500,
                    help="MPPI sample count (default: 500)")
-    p.add_argument("--horizon",     type=int,   default=20,
-                   help="MPPI horizon (default: 20)")
-    p.add_argument("--sigma",       type=float, default=0.5,
-                   help="MPPI noise sigma (default: 0.5)")
+    p.add_argument("--horizon",     type=int,   default=30,
+                   help="MPPI horizon (default: 30)")
+    p.add_argument("--sigma",       type=float, default=0.9,
+                   help="MPPI noise sigma (default: 0.9)")
     # ── obstacle configuration ────────────────────────────────────────────────
     p.add_argument("-n", "--num-obstacles", type=int, default=None, metavar="N",
                    help="Number of obstacles (default: random 3-8 each run)")
@@ -808,7 +838,7 @@ def main():
         horizon        = args.horizon,
         num_samples    = args.samples,
         dt             = STEPS_PER_MPPI * SIM_DT,  # 0.1 s
-        lambda_        = 1.0,
+        lambda_        = 7.0,
         sigma          = args.sigma,
         control_bounds = (-1.5, 1.5),
         safety_margin  = args.safety_margin,
