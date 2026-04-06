@@ -32,11 +32,11 @@ class MPPIGo2Controller(MPPIController):
 
     def __init__(
         self,
-        horizon: int = 20,
+        horizon: int = 30,
         num_samples: int = 500,
         dt: float = 0.1,
-        lambda_: float = 1.0,
-        sigma: float = 0.5,
+        lambda_: float = 7.0,
+        sigma: float = 0.9,
         control_bounds: Tuple[float, float] = (-1.5, 1.5),
         safety_margin: float = 0.5,
     ):
@@ -52,7 +52,8 @@ class MPPIGo2Controller(MPPIController):
             safety_margin=safety_margin,
         )
         # Tighter velocity regulation for the legged robot
-        self.Q_velocity = 0.2
+        self.Q_velocity = 0.05
+        self.Q_goal_running = 1.0
 
     # ------------------------------------------------------------------
     # Core overrides
@@ -108,6 +109,9 @@ class MPPIGo2Controller(MPPIController):
         for t in range(self.horizon):
             state   = trajectory[t]
             control = control_sequence[t]
+
+            # Running goal-progress cost — breaks local minima in front of walls
+            cost += self.Q_goal_running * np.linalg.norm(state[:2] - goal) ** 2
 
             # Control effort
             cost += self.R * np.linalg.norm(control) ** 2

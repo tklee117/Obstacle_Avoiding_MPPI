@@ -90,12 +90,13 @@ class MPPIController:
 
         self.U = np.zeros((self.horizon, self.control_dim))
 
-        self.Q_goal = 50.0 
+        self.Q_goal = 50.0
+        self.Q_goal_running = 1.0   # per-step goal progress cost
         self.Q_obstacle = (
-            500.0  # Obstacle avoidance weight 
+            500.0  # Obstacle avoidance weight
         )
-        self.R = 0.1  
-        self.Q_velocity = 0.5  
+        self.R = 0.1
+        self.Q_velocity = 0.5
 
         self.last_sampled_trajectories = []
         self.last_weights = []
@@ -167,6 +168,9 @@ class MPPIController:
         for t in range(self.horizon):
             state = trajectory[t]
             control = control_sequence[t]
+
+            # Running goal-progress cost — breaks the local minimum in front of walls
+            cost += self.Q_goal_running * np.linalg.norm(state[:2] - goal) ** 2
 
             # Control effort cost
             control_cost = self.R * np.linalg.norm(control) ** 2
