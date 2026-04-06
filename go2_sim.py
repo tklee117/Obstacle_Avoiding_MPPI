@@ -653,6 +653,10 @@ class Go2Simulator:
         ax.legend(loc="upper left", fontsize=8)
         title = ax.set_title("")
 
+        # traj_xy includes warmup points; rollout_history starts after warmup.
+        # Compute offset so exec_path indices align with rollout_history frames.
+        warmup_offset = len(traj_xy) - len(rollout_history)
+
         def _animate(frame):
             data       = rollout_history[frame]
             trajs      = data["trajectories"]
@@ -680,8 +684,10 @@ class Go2Simulator:
 
             robot.set_data([cur_pos[0]], [cur_pos[1]])
 
-            if frame > 0:
-                exec_path.set_data(traj_xy[:frame, 0], traj_xy[:frame, 1])
+            # Show all warmup points plus every executed position up to and
+            # including the current frame so the path stays under the robot dot.
+            end = warmup_offset + frame + 1
+            exec_path.set_data(traj_xy[:end, 0], traj_xy[:end, 1])
 
             eff = 1.0 / np.sum(weights ** 2) if np.sum(weights ** 2) > 0 else 0
             title.set_text(
