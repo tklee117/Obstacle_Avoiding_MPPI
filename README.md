@@ -24,6 +24,7 @@ The project includes two main applications:
 ├── mppi_hard_constraint.py   # Core MPPI controller + 2D simulation environment
 ├── mppi_go2.py               # Go2-specific MPPI (unicycle dynamics, velocity commands)
 ├── go2_sim.py                # MuJoCo simulation loop + locomotion policy integration
+├── global_planner.py         # A* global planner for collision-free waypoint paths
 ├── mppi_performance.py       # Benchmark suite: 20-scenario statistical testing
 ├── mppi_test.py              # Extensive parameter sensitivity testing framework
 └── output/                   # Saved plots, GIFs, and videos
@@ -34,7 +35,13 @@ The project includes two main applications:
 ## Architecture
 
 ```
-MPPI Planner (10 Hz)
+A* Global Planner (once at startup)
+    │  builds 2-D occupancy grid from obstacle SDFs
+    │  finds collision-free waypoint path: start → goal
+    │  provides pure-pursuit carrot point at runtime
+    ▼
+MPPI Local Planner (10 Hz)
+    │  receives carrot point (not raw goal) from A*
     │  samples N control sequences
     │  rolls out trajectories via dynamics model
     │  evaluates cost (goal + obstacles + velocity + control effort)
@@ -49,6 +56,12 @@ MuJoCo Physics (500 Hz)           [Go2 only]
     ▼
 Robot State → back to MPPI
 ```
+
+### Why A* + MPPI?
+
+MPPI is a local optimizer — it samples perturbations around the current nominal trajectory and cannot reliably escape local minima. In front of a wall, all forward trajectories incur high obstacle cost while all sideways trajectories incur high terminal goal cost. The weighted average collapses to near-zero velocity: the robot gets stuck.
+
+A* solves the **topological** problem (which side of the wall to go around) once, globally. MPPI solves the **local execution** problem (smooth, dynamically-feasible tracking) at 10 Hz. The carrot point from A* moves along the precomputed path as the robot progresses, so MPPI only ever sees a short-range, unobstructed subgoal.
 
 For the **2D point-mass** case, the dynamics are a double integrator:
 
@@ -71,11 +84,14 @@ At each planning step, every sampled trajectory is scored by:
 
 | Term | Formula | Purpose |
 |---|---|---|
-| Terminal goal cost | `Q_goal · ‖p_H − p_goal‖²` | Drive toward goal |
+| Terminal goal cost | `Q_goal · ‖p_H − p_goal‖²` | Drive toward goal at horizon end |
+| Running goal cost | `Q_goal_running · ‖p_t − p_goal‖²` per step | Break local minima; reward progress at every step |
 | Obstacle penalty | `Q_obs · max(0, r_i + d_safety − ‖p − c_i‖)²` | Repel from inflated obstacles |
 | Collision penalty | `10000 + 2000 · exp(…)` if `dist < 0` | Hard collision deterrent |
 | Velocity cost | `Q_vel · ‖v‖²` | Regulate speed |
 | Control effort | `R · ‖u‖²` | Smooth inputs |
+
+The **running goal cost** was added to supplement the terminal-only goal cost. Without it, a robot stuck in front of a wall sees symmetric cost in all directions (forward = obstacle penalty, sideways = high terminal cost) and the weighted average of samples collapses to zero velocity.
 
 Importance weights are computed via softmax with temperature λ:
 
@@ -89,18 +105,30 @@ The control sequence update is the weighted average of all sampled sequences.
 
 ## Key Parameters
 
-| Parameter | Symbol | Typical Value | Effect |
+### MPPI
+
+| Parameter | Symbol | Default (Go2) | Effect |
 |---|---|---|---|
-| Horizon | H | 15–20 steps | Lookahead distance |
-| Samples | N | 500–1000 | Solution quality vs. compute |
-| Noise std dev | σ | 0.5–10.0 | Exploration breadth |
-| Temperature | λ | 1.0–10.0 | Exploitation sharpness |
-| Safety margin | d_safety | 0.2–0.5 m | Buffer around obstacles |
+| Horizon | H | 30 steps (3 s) | Lookahead distance |
+| Samples | N | 500 | Solution quality vs. compute |
+| Noise std dev | σ | 0.9 | Exploration breadth |
+| Temperature | λ | 7.0 | Weight diversity; higher = keeps more trajectories alive |
+| Safety margin | d_safety | 0.5 m | Buffer around obstacles |
+| Running goal weight | Q_goal_running | 1.0 | Per-step progress toward goal |
+| Velocity weight | Q_vel | 0.05 | Resistance to lateral velocity bursts |
 
 **Key findings from parameter sweeps:**
 - Higher σ (more noise) *improves* success rate in cluttered environments — aggressive exploration helps escape local minima
-- Lower λ (sharper exploitation) consistently outperforms higher values
+- Lower λ (sharper exploitation) consistently outperforms higher values in open environments; higher λ is needed to keep sideways detour trajectories alive near walls
 - Moderate sample counts (100–500) match the performance of 1000+ samples at a fraction of the compute cost
+
+### A* Global Planner
+
+| Parameter | Default | Effect |
+|---|---|---|
+| Grid resolution | 0.15 m | Finer = more accurate path, slower build |
+| Safety margin | matches MPPI | Inflates obstacles consistently with the local planner |
+| Carrot lookahead | 1.5 m | How far ahead of the robot the MPPI subgoal is placed |
 
 ---
 
@@ -187,16 +215,17 @@ After each run, results are saved to `output/`:
 |---|---|
 | `results.png` | Trajectory, velocity, control inputs, cost evolution |
 | `safety_analysis.png` | Safety margin violations, clearance distances |
-| `go2_mppi_result.png` | Go2 navigation trajectory + command log |
-| `go2_mppi_rollouts.gif` | Animated MPPI rollouts (top-down view) |
+| `go2_mppi_result.png` | Go2 navigation trajectory (with A* path overlay) + command log |
+| `go2_mppi_rollouts.gif` | Animated MPPI rollouts with A* path overlay (top-down view) |
 | `go2_mppi_sim.gif` | MuJoCo offscreen render (if `--render` used) |
 
 ---
 
 ## Limitations & Future Work
 
-- **Static obstacles only** — dynamic environments require extensions to the cost function and dynamics model
-- **Parameter sensitivity** — performance varies with σ and λ; auto-tuning based on environment density would improve robustness
+- **Static obstacles only** — A* and MPPI both assume a static map; dynamic environments require replanning or extensions to the cost function
+- **A* replanning** — the global path is computed once at startup; if the robot is significantly perturbed or a new obstacle appears, A* would need to rerun
+- **Parameter sensitivity** — MPPI performance varies with σ and λ; auto-tuning based on environment density would improve robustness
 - **Computational scaling** — 1000-sample configurations can exceed real-time budgets on CPU; GPU vectorization would help
 - **Hardware validation** — real Go2 deployment would reveal additional practical constraints (latency, state estimation noise)
 
