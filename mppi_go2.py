@@ -14,6 +14,7 @@ import numpy as np
 from typing import List, Tuple
 
 from mppi_hard_constraint import MPPIController, Obstacle
+from cbf_filter import CBFSafetyFilter
 
 
 # Physical limits of the Go2 (from walk-these-ways training config)
@@ -39,6 +40,7 @@ class MPPIGo2Controller(MPPIController):
         sigma: float = 0.9,
         control_bounds: Tuple[float, float] = (-1.5, 1.5),
         safety_margin: float = 0.5,
+        cbf_gamma: float = 1.0,
     ):
         super().__init__(
             horizon=horizon,
@@ -54,6 +56,9 @@ class MPPIGo2Controller(MPPIController):
         # Tighter velocity regulation for the legged robot
         self.Q_velocity = 0.05
         self.Q_goal_running = 1.0
+
+        # CBF safety filter — post-processes MPPI output with a hard guarantee
+        self.cbf = CBFSafetyFilter(gamma=cbf_gamma)
 
     # ------------------------------------------------------------------
     # Core overrides
@@ -137,3 +142,34 @@ class MPPIGo2Controller(MPPIController):
 
         cost += collision_penalty
         return cost
+
+    def apply_cbf_filter(
+        self,
+        state: np.ndarray,
+        u_nominal: np.ndarray,
+        obstacles: List[Obstacle],
+    ) -> np.ndarray:
+        """
+        Apply the CBF-QP safety filter to the MPPI-optimal control.
+
+        Finds the control u* closest to u_nominal that satisfies:
+
+            ḣ_i(x, u*)  +  γ · h_i(x)  ≥  0    for every obstacle i
+
+        where  h_i = distance_from_surface(pos)  (the obstacle SDF).
+        The gradient ∇h_i is computed analytically for both circle and
+        rectangle shapes (piecewise, Option 1).
+
+        Parameters
+        ----------
+        state     : [x, y, yaw, vx_world, vy_world]
+        u_nominal : [cmd_vx, cmd_vy, cmd_yaw] from MPPI
+        obstacles : list of Obstacle (any mix of circle / rectangle)
+
+        Returns
+        -------
+        u_safe : CBF-filtered control with the same shape as u_nominal.
+                 Equals u_nominal when all CBF constraints are already
+                 satisfied; otherwise the minimum-norm modification.
+        """
+        return self.cbf.filter(state, u_nominal, obstacles)

@@ -216,7 +216,7 @@ def _build_scene_xml(obstacles, goal: np.ndarray) -> str:
         xml = fh.read()
 
     inject = ""
-    h = 0.5   # visual obstacle half-height (metres) — kept low so the dog is visible
+    h = 0.15  # visual obstacle half-height (metres) — short enough to see the robot body above
     for i, obs in enumerate(obstacles):
         if obs.shape == "circle":
             r_phys = obs.radius
@@ -432,11 +432,15 @@ class Go2Simulator:
         warmup_steps = int(warmup_time * SIM_FREQ)
 
         # Logging
-        traj_xy = []
+        traj_xy  = []
         cmd_log  = []
+        cbf_log  = []   # per-step CBF correction: [Δcmd_vx, Δcmd_vy, Δcmd_yaw]
 
         # Current MPPI command (updated at MPPI_FREQ)
         cmd_vx = cmd_vy = cmd_yaw = 0.0
+
+        # CBF correction for the current step (zero during warmup)
+        cbf_delta = np.zeros(3)
 
         # Optional offscreen renderer (EGL backend set at module top)
         renderer = None
@@ -498,9 +502,11 @@ class Go2Simulator:
                 robot_pos = np.array([pos_x, pos_y])
                 carrot = astar.get_carrot(global_path, robot_pos, CARROT_LOOKAHEAD)
 
-                state = np.array([pos_x, pos_y, yaw, vel_x, vel_y])
-                u_opt, _, _ = mppi.update_control(state, carrot, obstacles)
-                cmd_vx, cmd_vy, cmd_yaw = u_opt  # u_opt is already U[0], shape (3,)
+                state  = np.array([pos_x, pos_y, yaw, vel_x, vel_y])
+                u_mppi, _, _ = mppi.update_control(state, carrot, obstacles)
+                u_opt  = mppi.apply_cbf_filter(state, u_mppi, obstacles)
+                cbf_delta = u_opt - u_mppi          # how much CBF modified the command
+                cmd_vx, cmd_vy, cmd_yaw = u_opt
 
                 # Capture rollout snapshot for the 2-D animation
                 rollout_history.append({
@@ -521,6 +527,7 @@ class Go2Simulator:
                     goal_reached = True
                     traj_xy.append(np.array([pos_x, pos_y]))
                     cmd_log.append(np.array([cmd_vx, cmd_vy, cmd_yaw]))
+                    cbf_log.append(cbf_delta.copy())
                     break
 
                 # Periodic progress print
@@ -544,6 +551,7 @@ class Go2Simulator:
             if step % STEPS_PER_MPPI == 0:
                 traj_xy.append(np.array([self.data.qpos[0], self.data.qpos[1]]))
                 cmd_log.append(np.array([cmd_vx, cmd_vy, cmd_yaw]))
+                cbf_log.append(cbf_delta.copy())
 
                 if renderer is not None:
                     try:
@@ -553,28 +561,32 @@ class Go2Simulator:
                         renderer = None  # disable on first failure
 
         total_wall = time.time() - t_start
-        traj_xy = np.array(traj_xy) if traj_xy else np.zeros((1, 2))
-        cmd_log = np.array(cmd_log) if cmd_log else np.zeros((1, 3))
+        traj_xy  = np.array(traj_xy)  if traj_xy  else np.zeros((1, 2))
+        cmd_log  = np.array(cmd_log)  if cmd_log  else np.zeros((1, 3))
+        cbf_log  = np.array(cbf_log)  if cbf_log  else np.zeros((1, 3))
 
         print(f"Simulation finished in {total_wall:.1f}s real time.")
         print(f"Goal reached: {goal_reached}   Trajectory points: {len(traj_xy)}")
+        cbf_active = int(np.sum(np.linalg.norm(cbf_log[:, :2], axis=1) > 1e-3))
+        print(f"CBF filter active: {cbf_active}/{len(cbf_log)} steps "
+              f"({100 * cbf_active / max(len(cbf_log), 1):.1f}%)")
 
-        self._save_results(traj_xy, cmd_log, obstacles, goal, frames, rollout_history, output_dir, global_path)
+        self._save_results(traj_xy, cmd_log, cbf_log, obstacles, goal, frames, rollout_history, output_dir, global_path)
         return traj_xy, goal_reached
 
     # ── output generation ─────────────────────────────────────────────
 
-    def _save_results(self, traj_xy, cmd_log, obstacles, goal, frames, rollout_history, output_dir, global_path=None):
+    def _save_results(self, traj_xy, cmd_log, cbf_log, obstacles, goal, frames, rollout_history, output_dir, global_path=None):
         """Save trajectory plot, rollout GIF, and (if available) MuJoCo video."""
-        self._save_trajectory_plot(traj_xy, cmd_log, obstacles, goal, output_dir, global_path)
+        self._save_trajectory_plot(traj_xy, cmd_log, cbf_log, obstacles, goal, output_dir, global_path)
         if rollout_history:
             self._save_rollout_gif(traj_xy, rollout_history, obstacles, goal, output_dir, global_path=global_path)
         if frames:
             self._save_video(frames, output_dir)
 
-    def _save_trajectory_plot(self, traj_xy, cmd_log, obstacles, goal, output_dir, global_path=None):
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        ax_traj, ax_cmd, ax_dist = axes
+    def _save_trajectory_plot(self, traj_xy, cmd_log, cbf_log, obstacles, goal, output_dir, global_path=None):
+        fig, axes = plt.subplots(1, 4, figsize=(26, 6))
+        ax_traj, ax_cmd, ax_dist, ax_cbf = axes
 
         # ── trajectory ────────────────────────────────────────────────
         ax_traj.set_title("MPPI + Go2 Navigation (MuJoCo)")
@@ -627,6 +639,50 @@ class Go2Simulator:
         ax_dist.plot(t_axis[:len(dists)], dists, "g-", linewidth=2)
         ax_dist.axhline(y=0.3, color="r", linestyle="--", alpha=0.7, label="Goal threshold (0.3m)")
         ax_dist.legend()
+
+        # ── CBF filter activation ─────────────────────────────────────
+        # cbf_log[:, :2] = [Δcmd_vx, Δcmd_vy] — the correction applied to the
+        # translational velocity commands.  A non-zero norm means the CBF QP
+        # overrode MPPI to keep the robot safe.
+        t_cbf = np.arange(len(cbf_log)) * (STEPS_PER_MPPI * SIM_DT)
+        cbf_norm = np.linalg.norm(cbf_log[:, :2], axis=1)   # (N,) scalar correction
+        active   = cbf_norm > 1e-3                            # boolean mask
+        n_active = int(np.sum(active))
+        pct      = 100.0 * n_active / max(len(cbf_norm), 1)
+
+        ax_cbf.set_title(f"CBF Filter Activation  ({n_active}/{len(cbf_norm)} steps, {pct:.1f}%)")
+        ax_cbf.set_xlabel("Time (s)")
+        ax_cbf.set_ylabel("Velocity correction ‖Δu‖ (m/s)")
+        ax_cbf.grid(True, alpha=0.3)
+
+        ax_cbf.plot(t_cbf, cbf_norm, color="purple", linewidth=2, label="‖Δu‖ (CBF correction)")
+        ax_cbf.fill_between(t_cbf, cbf_norm, where=active,
+                            color="purple", alpha=0.25, label="CBF active")
+
+        # Overlay min SDF to any obstacle — shows *why* CBF fires
+        if len(traj_xy) > 0 and len(obstacles) > 0:
+            min_sdf = np.array([
+                min(obs.distance_from_surface(p) for obs in obstacles)
+                for p in traj_xy
+            ])
+            safety_margin = obstacles[0].safety_margin
+            ax_sdf = ax_cbf.twinx()
+            ax_sdf.plot(t_axis[:len(min_sdf)], min_sdf,
+                        color="orange", linewidth=1.5, linestyle="--",
+                        alpha=0.8, label="Min SDF (m)")
+            ax_sdf.axhline(y=0.0, color="red", linewidth=1.0, linestyle=":",
+                           alpha=0.8, label="Obstacle surface (SDF=0)")
+            ax_sdf.axhline(y=safety_margin, color="orange", linewidth=1.0,
+                           linestyle=":", alpha=0.8,
+                           label=f"Safety zone edge (SDF={safety_margin}m)")
+            ax_sdf.set_ylabel("SDF to nearest obstacle (m)", color="orange")
+            ax_sdf.tick_params(axis="y", labelcolor="orange")
+            # Merge legends from both axes
+            h1, l1 = ax_cbf.get_legend_handles_labels()
+            h2, l2 = ax_sdf.get_legend_handles_labels()
+            ax_cbf.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=7)
+        else:
+            ax_cbf.legend(loc="upper right")
 
         plt.tight_layout()
         path = os.path.join(output_dir, "go2_mppi_result.png")
@@ -743,7 +799,7 @@ class Go2Simulator:
                 w_px, h_px = fig.canvas.get_width_height()
                 img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
                 frames_out.append(img.reshape(h_px, w_px, 3))
-            imageio.mimsave(gif_path, frames_out, fps=5, loop=0)
+            imageio.mimsave(gif_path, frames_out, fps=10, loop=0)
             print(f"Saved rollout GIF: {gif_path}")
         except Exception as e:
             print(f"Rollout GIF save failed: {e}")
@@ -756,9 +812,9 @@ class Go2Simulator:
         # GIF — always works with imageio + pillow (no ffmpeg needed)
         gif_path = os.path.join(output_dir, "go2_mppi_sim.gif")
         try:
-            # Downsample to every other frame so the GIF isn't too large
-            gif_frames = frames[::2]
-            imageio.mimsave(gif_path, gif_frames, fps=5, loop=0)
+            # Frames are captured at 10 Hz; play at 10 fps → real-time speed,
+            # matching the rollout GIF frame rate exactly.
+            imageio.mimsave(gif_path, frames, fps=10, loop=0)
             print(f"Saved GIF: {gif_path}")
         except Exception as e:
             print(f"GIF save failed: {e}")
@@ -800,6 +856,8 @@ def parse_args():
                    help="Safety margin in metres added to every obstacle (default: 0.5)")
     p.add_argument("--seed", type=int, default=None,
                    help="Random seed for reproducible obstacle layouts")
+    p.add_argument("--cbf-gamma", type=float, default=1.0, metavar="G",
+                   help="CBF decay-rate γ: larger = more conservative filter (default: 1.0)")
     return p.parse_args()
 
 
@@ -842,6 +900,7 @@ def main():
         sigma          = args.sigma,
         control_bounds = (-1.5, 1.5),
         safety_margin  = args.safety_margin,
+        cbf_gamma      = args.cbf_gamma,
     )
 
     # ── run ───────────────────────────────────────────────────────────────────
