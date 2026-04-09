@@ -31,16 +31,26 @@ class AStarPlanner:
         bounds: Tuple[float, float, float, float],  # xmin, xmax, ymin, ymax
         resolution: float = 0.15,
         safety_margin: float = 0.5,
+        robot_half_width: float = 0.0,
+        robot_half_length: float = 0.0,
     ):
-        self.obstacles     = obstacles
-        self.resolution    = resolution
-        self.safety_margin = safety_margin
+        self.obstacles          = obstacles
+        self.resolution         = resolution
+        self.safety_margin      = safety_margin
+        # Lateral half-extent used for grid inflation.  A cell is free only if
+        # the dog's side can clear the obstacle by at least safety_margin when
+        # the body is aligned with the passage (best-case orientation).
+        self.robot_half_width   = robot_half_width
+        # Fore-aft half-extent kept for reference / future use.
+        self.robot_half_length  = robot_half_length
 
         self.xmin, self.xmax, self.ymin, self.ymax = bounds
         self.nx = int(np.ceil((self.xmax - self.xmin) / resolution)) + 1
         self.ny = int(np.ceil((self.ymax - self.ymin) / resolution)) + 1
 
         print(f"A* grid: {self.nx}×{self.ny} cells at {resolution:.2f} m resolution")
+        print(f"  Robot footprint: {2*robot_half_length:.2f} m × {2*robot_half_width:.2f} m  "
+              f"effective margin: {safety_margin + robot_half_width:.2f} m")
         self.grid = self._build_grid()
         free = int(np.sum(~self.grid))
         print(f"  Free cells: {free}/{self.nx * self.ny}")
@@ -48,13 +58,22 @@ class AStarPlanner:
     # ── grid helpers ──────────────────────────────────────────────────────────
 
     def _build_grid(self) -> np.ndarray:
-        """True = occupied (inside inflated obstacle), False = free."""
+        """True = occupied (inside inflated obstacle), False = free.
+
+        A cell is marked occupied if the robot's center placed there would put
+        the dog's lateral body surface closer than ``safety_margin`` to any
+        obstacle surface, assuming the dog is optimally aligned (long axis
+        parallel to the passage).  This means the required center-to-surface
+        clearance is ``safety_margin + robot_half_width``, ensuring A* only
+        plans paths the dog can physically thread through.
+        """
+        effective_margin = self.safety_margin + self.robot_half_width
         grid = np.zeros((self.nx, self.ny), dtype=bool)
         for ix in range(self.nx):
             for iy in range(self.ny):
                 pos = self._idx_to_pos(ix, iy)
                 for obs in self.obstacles:
-                    if obs.distance_from_surface(pos) < self.safety_margin:
+                    if obs.distance_from_surface(pos) < effective_margin:
                         grid[ix, iy] = True
                         break
         return grid

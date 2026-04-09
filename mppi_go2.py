@@ -142,31 +142,26 @@ class MPPIGo2Controller(MPPIController):
             velocity = state[3:5]
             cost += self.Q_velocity * np.linalg.norm(velocity) ** 2
 
-            # Obstacle costs — rectangular footprint distance instead of
-            # point-mass distance.  The robot's half-extents are projected
-            # onto the direction toward each obstacle centre so that a narrow
-            # corridor favours aligning the long axis with the passage.
+            # Obstacle costs — bounding-rectangle footprint.
+            # Evaluate the SDF at each of the 4 corners of the robot's body
+            # rectangle and take the minimum, giving the true closest clearance
+            # from any part of the dog's body to each obstacle surface.
             cos_y = np.cos(yaw)
             sin_y = np.sin(yaw)
+            # 4 corners in body frame (long-axis = x, lateral = y)
+            corners = []
+            for lx, ly in (( GO2_HALF_LENGTH,  GO2_HALF_WIDTH),
+                            ( GO2_HALF_LENGTH, -GO2_HALF_WIDTH),
+                            (-GO2_HALF_LENGTH,  GO2_HALF_WIDTH),
+                            (-GO2_HALF_LENGTH, -GO2_HALF_WIDTH)):
+                corners.append(np.array([
+                    x + lx * cos_y - ly * sin_y,
+                    y + lx * sin_y + ly * cos_y,
+                ]))
+
             for obstacle in obstacles:
-                dist_center = obstacle.distance_from_surface(state[:2])
-
-                # Support-function half-extent of the robot rectangle in the
-                # direction toward the obstacle centre.
-                dx = obstacle.x - x
-                dy = obstacle.y - y
-                d_obs = np.hypot(dx, dy)
-                if d_obs > 1e-6:
-                    # Unit vector toward obstacle in world frame → body frame
-                    nx_body =  (dx * cos_y + dy * sin_y) / d_obs
-                    ny_body = (-dx * sin_y + dy * cos_y) / d_obs
-                    half_extent = (GO2_HALF_LENGTH * abs(nx_body) +
-                                   GO2_HALF_WIDTH  * abs(ny_body))
-                else:
-                    half_extent = max(GO2_HALF_LENGTH, GO2_HALF_WIDTH)
-
-                # Distance from the robot's footprint surface to the obstacle
-                dist = dist_center - half_extent
+                # Minimum clearance from the dog's footprint to this obstacle
+                dist = min(obstacle.distance_from_surface(c) for c in corners)
 
                 if dist < obstacle.safety_margin:
                     penetration = obstacle.safety_margin - dist

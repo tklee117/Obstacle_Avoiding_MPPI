@@ -42,7 +42,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
 from mppi_hard_constraint import Obstacle, MPPISimulation
-from mppi_go2 import MPPIGo2Controller
+from mppi_go2 import MPPIGo2Controller, GO2_HALF_WIDTH, GO2_HALF_LENGTH
 from global_planner import AStarPlanner
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -477,6 +477,8 @@ class Go2Simulator:
             obstacles, bounds,
             resolution=0.15,
             safety_margin=mppi.safety_margin,
+            robot_half_width=GO2_HALF_WIDTH,
+            robot_half_length=GO2_HALF_LENGTH,
         )
         global_path = astar.plan(start_pos, goal)
         if global_path is None:
