@@ -22,6 +22,10 @@ VX_LIMIT = 1.5    # m/s forward/back
 VY_LIMIT = 0.8    # m/s lateral
 YAW_LIMIT = 1.0   # rad/s
 
+# Go2 body half-extents for rectangular footprint obstacle cost
+GO2_HALF_LENGTH = 0.35   # metres fore–aft  (body ≈ 0.70 m long)
+GO2_HALF_WIDTH  = 0.15   # metres lateral   (body ≈ 0.30 m wide)
+
 
 class MPPIGo2Controller(MPPIController):
     """
@@ -56,6 +60,8 @@ class MPPIGo2Controller(MPPIController):
         # Tighter velocity regulation for the legged robot
         self.Q_velocity = 0.05
         self.Q_goal_running = 1.0
+        # Heading-toward-goal cost weight; only active when dist > 0.3 m
+        self.Q_yaw = 1.5
 
         # CBF safety filter — post-processes MPPI output with a hard guarantee
         self.cbf = CBFSafetyFilter(gamma=cbf_gamma)
@@ -114,21 +120,53 @@ class MPPIGo2Controller(MPPIController):
         for t in range(self.horizon):
             state   = trajectory[t]
             control = control_sequence[t]
+            x, y, yaw = state[0], state[1], state[2]
 
             # Running goal-progress cost — breaks local minima in front of walls
             cost += self.Q_goal_running * np.linalg.norm(state[:2] - goal) ** 2
 
-            # Control effort
-            cost += self.R * np.linalg.norm(control) ** 2
+            # Heading-toward-goal cost — drives yaw to face the current carrot.
+            # Only active when far enough away that atan2 is well-conditioned.
+            dist_to_goal = np.hypot(goal[0] - x, goal[1] - y)
+            if dist_to_goal > 0.3:
+                desired_yaw = np.arctan2(goal[1] - y, goal[0] - x)
+                yaw_err = (yaw - desired_yaw + np.pi) % (2 * np.pi) - np.pi
+                cost += self.Q_yaw * yaw_err ** 2
+
+            # Control effort — translational only; yaw is guided by Q_yaw above
+            # so excluding cmd_yaw here lets MPPI rotate freely without double-
+            # penalising heading corrections.
+            cost += self.R * (control[0] ** 2 + control[1] ** 2)
 
             # Velocity magnitude penalty (world-frame vx, vy)
             velocity = state[3:5]
             cost += self.Q_velocity * np.linalg.norm(velocity) ** 2
 
-            # Obstacle costs (signed-distance based)
-            pos = state[:2]
+            # Obstacle costs — rectangular footprint distance instead of
+            # point-mass distance.  The robot's half-extents are projected
+            # onto the direction toward each obstacle centre so that a narrow
+            # corridor favours aligning the long axis with the passage.
+            cos_y = np.cos(yaw)
+            sin_y = np.sin(yaw)
             for obstacle in obstacles:
-                dist = obstacle.distance_from_surface(pos)
+                dist_center = obstacle.distance_from_surface(state[:2])
+
+                # Support-function half-extent of the robot rectangle in the
+                # direction toward the obstacle centre.
+                dx = obstacle.x - x
+                dy = obstacle.y - y
+                d_obs = np.hypot(dx, dy)
+                if d_obs > 1e-6:
+                    # Unit vector toward obstacle in world frame → body frame
+                    nx_body =  (dx * cos_y + dy * sin_y) / d_obs
+                    ny_body = (-dx * sin_y + dy * cos_y) / d_obs
+                    half_extent = (GO2_HALF_LENGTH * abs(nx_body) +
+                                   GO2_HALF_WIDTH  * abs(ny_body))
+                else:
+                    half_extent = max(GO2_HALF_LENGTH, GO2_HALF_WIDTH)
+
+                # Distance from the robot's footprint surface to the obstacle
+                dist = dist_center - half_extent
 
                 if dist < obstacle.safety_margin:
                     penetration = obstacle.safety_margin - dist
